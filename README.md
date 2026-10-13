@@ -4,10 +4,7 @@
 
 PCと操作先の端末をネットワークでつなぐ必要はありません。PCにUSBで挿した M5Stack AtomS3 Lite が、操作先からは普通のBluetoothキーボード兼マウスとして見えます。操作先に専用ソフトを入れる必要もありません。
 
-```
-Windows PC ──USB──▶ M5Stack AtomS3 Lite ──Bluetooth (HID)──▶ 操作先の端末
- (このアプリ)
-```
+![Remote Input のしくみ: Windows PCのアプリが取り込んだキーボードとマウスの入力を、USB接続した M5Stack AtomS3 Lite がBluetoothのキーボードとマウスとして操作先の端末へ送る](https://raw.githubusercontent.com/kettle13/RemoteKeyboard/assets/overview.png)
 
 ## 必要なもの
 

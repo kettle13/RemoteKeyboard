@@ -1,0 +1,76 @@
+name: Build
+
+# Every push and pull request is built. Pushing a tag such as v0.1.0 also
+# publishes the build as a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Framework-dependent: the .NET 10 Desktop Runtime is installed separately.
+      - name: Publish
+        shell: bash
+        run: >
+          dotnet publish app/RemoteInput.csproj -c Release -r win-x64 --self-contained false
+          -p:Platform=x64 -p:Version=${{ steps.version.outputs.version }} -p:DebugType=none
+          -o publish
+
+      - name: Add license files
+        shell: bash
+        run: cp LICENSE THIRD-PARTY-NOTICES.md README.md publish/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RemoteInput-${{ steps.version.outputs.version }}-win-x64
+          path: publish/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      ASSET: RemoteInput-${{ needs.build.outputs.version }}-win-x64
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+
+      - name: Create zip
+        run: zip -r "$ASSET.zip" "$ASSET"
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" "$ASSET.zip"
+          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

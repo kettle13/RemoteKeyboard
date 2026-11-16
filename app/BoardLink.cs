@@ -16,6 +16,31 @@ internal sealed record BoardInfo(string SerialNumber, string PortName)
     public override string ToString() => $"{SerialNumber} ({PortName})";
 }
 
+/// <summary>STの応答。</summary>
+/// <param name="Connected">接続先とのBluetooth接続が確立している(暗号化済み)。</param>
+/// <param name="Slot">ボードが選んでいるスロット番号。不明なら0。</param>
+/// <param name="Standby">どの接続先も受け付けていない待機状態。</param>
+/// <param name="Pairing">新しい接続先とのペアリングを受付中。</param>
+internal readonly record struct BoardStatus(bool Connected, int Slot, bool Standby, bool Pairing)
+{
+    public static BoardStatus Parse(string line)
+    {
+        int slot = 0;
+        int at = line.IndexOf(" slot=", StringComparison.Ordinal);
+        if (at >= 0)
+        {
+            ReadOnlySpan<char> rest = line.AsSpan(at + 6);
+            int end = rest.IndexOf(' ');
+            int.TryParse(end < 0 ? rest : rest[..end], NumberStyles.None, CultureInfo.InvariantCulture, out slot);
+        }
+        return new BoardStatus(
+            line.StartsWith("OK conn=1", StringComparison.Ordinal),
+            slot,
+            line.Contains(" standby=1", StringComparison.Ordinal),
+            line.Contains(" pairing=1", StringComparison.Ordinal));
+    }
+}
+
 /// <summary>
 /// 中継ボード(M5Stack AtomS3 Lite)とのUSBシリアル通信。入力イベントをキューに積み、送信スレッドが
 /// テキストコマンド(KR / MR)として順に送る。
@@ -48,18 +73,30 @@ internal sealed class BoardLink : IDisposable
     private volatile bool _closing;
     private bool _statusRequested;
     private int _slotRequested;
-    private bool _connectRequested;
+    private readonly List<string> _commands = [];
     private long _lastReceiveTick = Environment.TickCount64;
     private int _lostRaised;
 
-    /// <summary>
-    /// STの応答を受けたとき。引数は接続先とのBLE接続有無、ボードが選んでいるスロット番号
-    /// (不明なら0)、本体ボタンによる切断中(待機)かどうか。受信スレッドから呼ばれる。
-    /// </summary>
-    public event Action<bool, int, bool>? StatusReceived;
+    /// <summary>STの応答を受けたとき。受信スレッドから呼ばれる。</summary>
+    public event Action<BoardStatus>? StatusReceived;
 
     /// <summary>本体のボタンが押され、ボードが接続先を切断したとき。受信スレッドから呼ばれる。</summary>
     public event Action? ButtonPressed;
+
+    /// <summary>PCからの通信が途絶えたため、ボードが自分で切断したとき。受信スレッドから呼ばれる。</summary>
+    public event Action? IdleDisconnected;
+
+    /// <summary>ペアリング中の接続先がパスキーを表示し、入力を待っているとき。受信スレッドから呼ばれる。</summary>
+    public event Action? PasskeyRequested;
+
+    /// <summary>新しい接続先とのペアリングが完了したとき。受信スレッドから呼ばれる。</summary>
+    public event Action? Paired;
+
+    /// <summary>ペアリングの受付が(完了以外の理由で)終わったとき。受信スレッドから呼ばれる。</summary>
+    public event Action? PairingEnded;
+
+    /// <summary>ペアリングが失敗したとき(パスキー違いなど)。受信スレッドから呼ばれる。</summary>
+    public event Action? PairingFailed;
 
     /// <summary>接続先とのBLE接続が切れているとボードが報告したとき。受信スレッドから呼ばれる。</summary>
     public event Action? TargetDisconnected;
@@ -166,7 +203,7 @@ internal sealed class BoardLink : IDisposable
         _wake.Set();
     }
 
-    /// <summary>キューが空になるまで待つ(終了前にReleaseAllを確実に送るため)。</summary>
+    /// <summary>キューと指示が空になるまで待つ(終了前にReleaseAllやDISCONNECTを確実に送るため)。</summary>
     public void Flush(int timeoutMs)
     {
         var elapsed = Stopwatch.StartNew();
@@ -174,10 +211,12 @@ internal sealed class BoardLink : IDisposable
         {
             lock (_lock)
             {
-                if (_queue.Count == 0) return;
+                if (_queue.Count == 0 && _commands.Count == 0) break;
             }
             Thread.Sleep(2);
         }
+        // 取り出し済みの最後の行が書き込まれるのを少し待つ
+        Thread.Sleep(20);
     }
 
     /// <summary>接続先スロットを切り替える。ボードは再起動して新しいスロットで待ち受ける。</summary>
@@ -186,15 +225,31 @@ internal sealed class BoardLink : IDisposable
         lock (_lock)
         {
             _queue.Clear();
+            _commands.Clear();  // 再起動するので、前のスロット向けの指示は捨てる
             _slotRequested = slot;
         }
         _wake.Set();
     }
 
-    /// <summary>本体ボタンによる切断(待機)を解除し、選択中のスロットの接続先を待ち受けさせる。</summary>
-    public void Connect()
+    /// <summary>選択中のスロットにペアリング済みの接続先からの接続を受け付けさせる。</summary>
+    public void Connect() => SendCommand("CONNECT");
+
+    /// <summary>Bluetooth接続を切り、どの接続先も受け付けない待機状態にする。</summary>
+    public void Disconnect()
     {
-        lock (_lock) _connectRequested = true;
+        lock (_lock) _queue.Clear();
+        SendCommand("DISCONNECT");
+    }
+
+    /// <summary>選択中のスロットで、新しい接続先とのペアリングを一定時間受け付けさせる。</summary>
+    public void Pair() => SendCommand("PAIR");
+
+    /// <summary>接続先が表示した6桁のパスキーを渡す。</summary>
+    public void SendPasskey(string digits) => SendCommand($"PASSKEY {digits}");
+
+    private void SendCommand(string command)
+    {
+        lock (_lock) _commands.Add(command);
         _wake.Set();
     }
 
@@ -221,15 +276,18 @@ internal sealed class BoardLink : IDisposable
                 bool hasReport = false;
                 bool status;
                 int slot;
-                bool connect;
+                string[] commands = [];
                 lock (_lock)
                 {
                     status = _statusRequested;
                     _statusRequested = false;
                     slot = _slotRequested;
                     _slotRequested = 0;
-                    connect = _connectRequested;
-                    _connectRequested = false;
+                    if (_commands.Count > 0)
+                    {
+                        commands = [.. _commands];
+                        _commands.Clear();
+                    }
                     if (_queue.First is { } first)
                     {
                         // 末尾のマウスレポートは合算中なので、間隔が空くまで送らない
@@ -244,7 +302,7 @@ internal sealed class BoardLink : IDisposable
                 }
 
                 if (slot != 0) _port.WriteLine(string.Create(CultureInfo.InvariantCulture, $"SLOT {slot}"));
-                if (connect) _port.WriteLine("CONNECT");
+                foreach (string command in commands) _port.WriteLine(command);
                 if (status) _port.WriteLine("ST");
 
                 if (hasReport)
@@ -299,15 +357,32 @@ internal sealed class BoardLink : IDisposable
 
                 if (line.StartsWith("OK conn=", StringComparison.Ordinal))
                 {
-                    int slot = 0;
-                    int at = line.IndexOf(" slot=", StringComparison.Ordinal);
-                    if (at >= 0) int.TryParse(line.AsSpan(at + 6).Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out slot);
-                    StatusReceived?.Invoke(line.StartsWith("OK conn=1", StringComparison.Ordinal), slot,
-                        line.Contains(" standby=1", StringComparison.Ordinal));
+                    StatusReceived?.Invoke(BoardStatus.Parse(line));
                 }
                 else if (line.StartsWith("EV button", StringComparison.Ordinal))
                 {
                     ButtonPressed?.Invoke();
+                }
+                else if (line.StartsWith("EV idle", StringComparison.Ordinal))
+                {
+                    IdleDisconnected?.Invoke();
+                }
+                else if (line.StartsWith("EV passkey", StringComparison.Ordinal))
+                {
+                    PasskeyRequested?.Invoke();
+                }
+                else if (line.StartsWith("EV paired", StringComparison.Ordinal))
+                {
+                    Paired?.Invoke();
+                }
+                else if (line.StartsWith("EV pair end", StringComparison.Ordinal))
+                {
+                    PairingEnded?.Invoke();
+                }
+                else if (line.StartsWith("EV auth bonded=0", StringComparison.Ordinal) ||
+                         line.StartsWith("EV auth bonded=1 encrypted=0", StringComparison.Ordinal))
+                {
+                    PairingFailed?.Invoke();
                 }
                 else if (line.StartsWith("ERR not connected", StringComparison.Ordinal) ||
                          line.StartsWith("EV disconnect", StringComparison.Ordinal))

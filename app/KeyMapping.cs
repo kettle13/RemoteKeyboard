@@ -14,6 +14,12 @@ internal sealed class TargetProfile
     public string? Name { get; set; }
 
     public List<KeyMapEntry> KeyMap { get; set; } = [];
+
+    /// <summary>
+    /// 制御を終えるたびにBluetooth接続を切る。iPad / iPhone はBluetoothキーボードが
+    /// つながっている間は画面キーボードを出さないため。
+    /// </summary>
+    public bool DisconnectAfterUse { get; set; }
 }
 
 internal sealed record KeyPreset(string Name, (byte From, byte To)[] Entries)
